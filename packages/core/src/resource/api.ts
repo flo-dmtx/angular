@@ -241,6 +241,21 @@ export interface BaseResourceOptions<T, R> {
    * This value value needs to be identical for both the client and server.
    */
   id?: string;
+
+  /**
+   * Whether the resource defers loading until the first time one of its signals is read.
+   *
+   * A lazy resource performs no work at creation. `params` changes while unread do not trigger
+   * loads; the first read uses the latest params. Afterwards it re-loads on `params` changes
+   * while observed (a template or effect reading it) and at the next read otherwise. Once
+   * loaded, the value is retained even when nothing reads the resource anymore.
+   *
+   * Not recommended with `id`: the `TransferState` cache is only consulted during hydration,
+   * usually over by the time a lazy resource is first read.
+   *
+   * Defaults to `false` (the loader runs eagerly whenever `params` change).
+   */
+  lazy?: boolean;
 }
 
 /**

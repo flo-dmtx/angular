@@ -139,6 +139,32 @@ The `status` signal provides a specific `ResourceStatus` that describes the stat
 
 You can use this status information to conditionally display user interface elements, such as loading indicators and error messages.
 
+## Lazy resources
+
+By default, a resource runs its loader eagerly: as soon as it is created, and again whenever its `params` change. Setting `lazy: true` on `resource` or `rxResource` defers all work until the resource is actually needed — the loader only runs the first time any of the resource's signals (`value`, `status`, `error`, `isLoading`, `hasValue`, `snapshot`) is read.
+
+```typescript
+const userId: Signal<string> = getUserId();
+
+const userResource = resource({
+  lazy: true,
+  params: () => ({id: userId()}),
+  loader: ({params}) => fetchUser(params),
+});
+```
+
+Because templates read signals, a lazy resource read only from inside an `@if` block, a closed tab, or an untriggered `@defer` block never fetches until that part of the UI actually renders. Once it has loaded, the value is retained even when nothing reads the resource anymore — showing the UI again does not re-fetch.
+
+Laziness follows these rules:
+
+- `params` changes while the resource has never been read do not trigger loads. The first read uses the latest params.
+- After the first read, the resource re-loads on `params` changes as long as something observes it, such as a template or an effect. Without a live observer, a `params` change or a `reload()` call takes effect at the next read.
+- Reading a lazy resource before it resolves returns `undefined` (or `defaultValue`) with the `'loading'` status, exactly like an eager resource.
+- Calling `set()` before any read moves the resource to the `'local'` status without ever running the loader.
+- A lazy resource that is never read never affects application stability, so server-side rendering does not wait for it.
+
+NOTE: Avoid combining `lazy` with the `id` option for [SSR caching](#caching-resource-data-with-ssr): the transferred value is only consulted during hydration, which has usually completed by the time a lazy resource is first read.
+
 ## Caching `resource` data with SSR
 
 When an application renders on the server, a resource loader runs once to produce the initial HTML. During hydration, the browser normally runs the same loader again.

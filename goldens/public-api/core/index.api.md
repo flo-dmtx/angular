@@ -191,6 +191,7 @@ export interface BaseResourceOptions<T, R> {
     equal?: ValueEqualityFn<T>;
     id?: string;
     injector?: Injector;
+    lazy?: boolean;
     params?: (ctx: ResourceParamsContext) => R;
 }
 

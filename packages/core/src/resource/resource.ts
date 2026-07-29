@@ -6,6 +6,17 @@
  * found in the LICENSE file at https://angular.dev/license
  */
 
+import {
+  consumerAfterComputation,
+  consumerBeforeComputation,
+  consumerDestroy,
+  producerAccessed,
+  producerUpdateValueVersion,
+  REACTIVE_NODE,
+  ReactiveNode,
+  runPostProducerCreatedFn,
+  setActiveConsumer,
+} from '../../primitives/signals';
 import {isSignal, Signal, ValueEqualityFn} from '../render3/reactivity/api';
 import {computed} from '../render3/reactivity/computed';
 import {effect, EffectRef} from '../render3/reactivity/effect';
@@ -81,10 +92,59 @@ export function resource<T, R>(options: ResourceOptions<T, R>): ResourceRef<T | 
     options.debugName,
     options.injector ?? inject(Injector),
     options.id as StateKey<T>,
+    /* getInitialStream */ undefined,
+    options.lazy ? 'lazy' : 'eager',
   );
 }
 
 type ResourceInternalStatus = 'idle' | 'loading' | 'resolved' | 'local';
+
+/**
+ * Sentinel marking a pull node that has never computed (`UNSET` from `computed` is not exported).
+ */
+const UNSET_PULL = /* @__PURE__ */ Symbol('UNSET_PULL');
+
+/**
+ * Reactive node driving a lazy resource in place of the load effect: pulled by every public
+ * signal read, tracking `extRequest`, it recomputes on the first read and on params/reload
+ * changes — and recomputing is where the load starts.
+ */
+interface ResourcePullNode extends ReactiveNode {
+  value: WrappedRequest | typeof UNSET_PULL;
+  readExtRequest: () => WrappedRequest;
+  load: () => void;
+}
+
+// Note: Using an IIFE here to ensure that the spread assignment is not considered a side-effect,
+// allowing `RESOURCE_PULL_NODE` to be tree-shaken away when unused.
+const RESOURCE_PULL_NODE = /* @__PURE__ */ (() => {
+  return {
+    ...REACTIVE_NODE,
+    value: UNSET_PULL,
+    dirty: true,
+    // A node that has never computed has no tracked dependency to have changed, so nothing else
+    // would make `producerUpdateValueVersion` run the computation a first time.
+    producerMustRecompute: (node: ResourcePullNode) => node.value === UNSET_PULL,
+    producerRecomputeValue: (node: ResourcePullNode) => {
+      const prevConsumer = consumerBeforeComputation(node);
+      try {
+        const extRequest = node.readExtRequest();
+        // Record the pull before loading, so a loader reading the resource back cannot re-enter.
+        node.value = extRequest;
+        node.version++;
+        // The load is a side effect: a synchronous stream settles the state during this read.
+        const consumer = setActiveConsumer(null);
+        try {
+          node.load();
+        } finally {
+          setActiveConsumer(consumer);
+        }
+      } finally {
+        consumerAfterComputation(node, prevConsumer);
+      }
+    },
+  };
+})();
 
 /**
  * Internal state of a resource.
@@ -189,7 +249,13 @@ export class ResourceImpl<T, R> extends BaseWritableResource<T> implements Resou
    * imperative command.
    */
   protected readonly extRequest: WritableSignal<WrappedRequest>;
-  private readonly effectRef: EffectRef;
+  private readonly effectRef: EffectRef | undefined;
+
+  /**
+   * In lazy mode, the pull node replaces the load effect: reading any public signal pulls it, the
+   * node tracks `extRequest`, and recomputing (first read, params change, reload) starts the load.
+   */
+  private readonly pullNode: ResourcePullNode | undefined;
 
   private pendingController: AbortController | undefined;
   private resolvePendingTask: (() => void) | undefined = undefined;
@@ -209,6 +275,7 @@ export class ResourceImpl<T, R> extends BaseWritableResource<T> implements Resou
     injector: Injector,
     private transferCacheKey: StateKey<T> | undefined,
     getInitialStream?: (request: R) => Signal<ResourceStreamItem<T>> | undefined,
+    loadStrategy: 'eager' | 'lazy' = 'eager',
   ) {
     if (isInParamsFunction()) {
       throw invalidResourceCreationInParams();
@@ -219,6 +286,7 @@ export class ResourceImpl<T, R> extends BaseWritableResource<T> implements Resou
       // `WritableSignal` that delegates to `ResourceImpl.set`.
       computed(
         () => {
+          this.pull();
           const streamValue = this.state().stream?.();
 
           if (!streamValue) {
@@ -319,11 +387,26 @@ export class ResourceImpl<T, R> extends BaseWritableResource<T> implements Resou
       ...(ngDevMode ? createDebugNameObject(debugName, 'state') : undefined),
     });
 
-    this.effectRef = effect(this.loadEffect.bind(this), {
-      injector,
-      manualCleanup: true,
-      ...(ngDevMode ? createDebugNameObject(debugName, 'loadEffect') : undefined),
-    });
+    if (loadStrategy === 'lazy') {
+      const node = Object.create(RESOURCE_PULL_NODE) as ResourcePullNode;
+      node.readExtRequest = () => this.extRequest();
+      node.load = () => {
+        if (!this.destroyed) {
+          this.loadEffect();
+        }
+      };
+      if (typeof ngDevMode !== 'undefined' && ngDevMode) {
+        node.debugName = createDebugNameObject(debugName, 'pull')?.debugName;
+      }
+      runPostProducerCreatedFn(node);
+      this.pullNode = node;
+    } else {
+      this.effectRef = effect(this.loadEffect.bind(this), {
+        injector,
+        manualCleanup: true,
+        ...(ngDevMode ? createDebugNameObject(debugName, 'loadEffect') : undefined),
+      });
+    }
 
     this.pendingTasks = injector.get(PendingTasks);
 
@@ -331,12 +414,20 @@ export class ResourceImpl<T, R> extends BaseWritableResource<T> implements Resou
     this.unregisterOnDestroy = injector.get(DestroyRef).onDestroy(() => this.destroy());
 
     this.status = computed(
-      () => projectStatusOfState(this.state()),
+      () => {
+        // Destroyed resources stay idle even if the params change afterwards.
+        if (this.destroyed) {
+          return 'idle';
+        }
+        this.pull();
+        return projectStatusOfState(this.state());
+      },
       ngDevMode ? createDebugNameObject(debugName, 'status') : undefined,
     );
 
     this.error = computed(
       () => {
+        this.pull();
         const stream = this.state().stream?.();
         return stream && !isResolved(stream) ? stream.error : undefined;
       },
@@ -352,15 +443,14 @@ export class ResourceImpl<T, R> extends BaseWritableResource<T> implements Resou
       return;
     }
 
-    const error = untracked(this.error);
+    // Read the raw state: the public signals pull, and set() must never start a load.
     const state = untracked(this.state);
+    const streamValue = state.stream && untracked(state.stream);
+    const error = streamValue && !isResolved(streamValue) ? streamValue.error : undefined;
 
-    if (!error) {
+    if (!error && state.status === 'local') {
       const current = untracked(this.value);
-      if (
-        state.status === 'local' &&
-        (this.equal ? this.equal(current, value) : current === value)
-      ) {
+      if (this.equal ? this.equal(current, value) : current === value) {
         return;
       }
     }
@@ -396,7 +486,10 @@ export class ResourceImpl<T, R> extends BaseWritableResource<T> implements Resou
   destroy(): void {
     this.destroyed = true;
     this.unregisterOnDestroy();
-    this.effectRef.destroy();
+    this.effectRef?.destroy();
+    if (this.pullNode !== undefined) {
+      consumerDestroy(this.pullNode);
+    }
     this.abortInProgressLoad();
 
     // Destroyed resources enter Idle state.
@@ -406,6 +499,14 @@ export class ResourceImpl<T, R> extends BaseWritableResource<T> implements Resou
       previousStatus: 'idle',
       stream: undefined,
     });
+  }
+
+  private pull(): void {
+    if (this.pullNode === undefined || this.destroyed) {
+      return;
+    }
+    producerUpdateValueVersion(this.pullNode);
+    producerAccessed(this.pullNode);
   }
 
   private async loadEffect(): Promise<void> {
