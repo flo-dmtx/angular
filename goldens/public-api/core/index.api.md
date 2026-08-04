@@ -191,6 +191,7 @@ export interface BaseResourceOptions<T, R> {
     equal?: ValueEqualityFn<T>;
     id?: string;
     injector?: Injector;
+    loadStrategy?: ResourceLoadStrategy;
     params?: (ctx: ResourceParamsContext) => R;
 }
 
@@ -1689,6 +1690,9 @@ export interface ResourceLoaderParams<R> {
         status: ResourceStatus;
     };
 }
+
+// @public
+export type ResourceLoadStrategy = 'eager' | 'whenTracked' | 'whileTracked';
 
 // @public
 export type ResourceOptions<T, R> = (PromiseResourceOptions<T, R> | StreamingResourceOptions<T, R>) & {

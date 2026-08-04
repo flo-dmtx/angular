@@ -150,6 +150,8 @@ export interface ReactiveNode {
     kind: ReactiveNodeKind;
     lastCleanEpoch: Version;
     producerMustRecompute(node: unknown): boolean;
+    producerOnUnwatched?(node: unknown): void;
+    producerOnWatched?(node: unknown): void;
     // (undocumented)
     producerRecomputeValue(node: unknown): void;
     producers: ReactiveLink | undefined;

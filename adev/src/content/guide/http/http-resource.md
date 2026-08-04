@@ -99,6 +99,10 @@ export class CharacterViewer {
 }
 ```
 
+## Lazy loading
+
+By default an `httpResource` sends its request as soon as it is created. Setting `loadStrategy: 'whenTracked'` or `loadStrategy: 'whileTracked'` defers the request until something actually tracks the resource, such as a template or an effect reading one of its signals. This keeps a service exposing many `httpResource`s from firing every request the moment the service is instantiated: each resource loads when the UI that shows it renders. See [Lazy resources](/guide/signals/resource#lazy-resources) for the full semantics.
+
 ## Testing an httpResource
 
 Because `httpResource` is a wrapper around `HttpClient`, you can test `httpResource` with the exact same APIs as `HttpClient`. See [HttpClient Testing](/guide/http/testing) for details.

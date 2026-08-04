@@ -12,6 +12,7 @@ import { Injector } from '@angular/core';
 import { ModuleWithProviders } from '@angular/core';
 import { Observable } from 'rxjs';
 import { Provider } from '@angular/core';
+import { ResourceLoadStrategy } from '@angular/core';
 import { ResourceParamsContext } from '@angular/core';
 import { ResourceRef } from '@angular/core';
 import { Signal } from '@angular/core';
@@ -928,6 +929,7 @@ export interface HttpResourceOptions<TResult, TRaw> {
     defaultValue?: NoInfer<TResult>;
     equal?: ValueEqualityFn<NoInfer<TResult>>;
     injector?: Injector;
+    loadStrategy?: ResourceLoadStrategy;
     parse?: (value: TRaw) => TResult;
 }
 

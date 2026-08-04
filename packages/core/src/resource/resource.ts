@@ -6,6 +6,13 @@
  * found in the LICENSE file at https://angular.dev/license
  */
 
+import {
+  consumerDestroy,
+  producerAccessed,
+  REACTIVE_NODE,
+  ReactiveNode,
+  runPostProducerCreatedFn,
+} from '../../primitives/signals';
 import {isSignal, Signal, ValueEqualityFn} from '../render3/reactivity/api';
 import {computed} from '../render3/reactivity/computed';
 import {effect, EffectRef} from '../render3/reactivity/effect';
@@ -21,6 +28,7 @@ import {
   ResourceStreamingLoader,
   ResourceStreamItem,
   StreamingResourceOptions,
+  type ResourceLoadStrategy,
   type ResourceParamsContext,
   type ResourceRef,
   type WritableResource,
@@ -81,10 +89,27 @@ export function resource<T, R>(options: ResourceOptions<T, R>): ResourceRef<T | 
     options.debugName,
     options.injector ?? inject(Injector),
     options.id as StateKey<T>,
+    /* getInitialStream */ undefined,
+    options.loadStrategy ?? 'eager',
   );
 }
 
 type ResourceInternalStatus = 'idle' | 'loading' | 'resolved' | 'local';
+
+/**
+ * Reactive node standing for « the resource is being tracked »: every public signal read
+ * registers it as a dependency, so the liveness of any listener (template, effect, possibly
+ * through layers of computeds) propagates to this node. Its watched/unwatched transitions are
+ * where a lazy resource wakes up and, for `whileTracked`, goes back to sleep. The node itself
+ * never recomputes and never notifies.
+ */
+const RESOURCE_TRACK_NODE = /* @__PURE__ */ (() => {
+  return {
+    ...REACTIVE_NODE,
+    producerMustRecompute: () => false,
+    producerRecomputeValue: () => {},
+  };
+})();
 
 /**
  * Internal state of a resource.
@@ -189,7 +214,16 @@ export class ResourceImpl<T, R> extends BaseWritableResource<T> implements Resou
    * imperative command.
    */
   protected readonly extRequest: WritableSignal<WrappedRequest>;
-  private readonly effectRef: EffectRef;
+  private readonly effectRef: EffectRef | undefined;
+
+  /**
+   * In lazy mode, the tracking node detects listeners; the load effect only exists while the
+   * resource is awake. `awake` mirrors that state reactively, so listeners that saw a dormant
+   * `idle` are notified when the resource starts loading.
+   */
+  private readonly trackNode: ReactiveNode | undefined;
+  private loadEffectRef: EffectRef | undefined;
+  private readonly awake: WritableSignal<boolean>;
 
   private pendingController: AbortController | undefined;
   private resolvePendingTask: (() => void) | undefined = undefined;
@@ -206,9 +240,10 @@ export class ResourceImpl<T, R> extends BaseWritableResource<T> implements Resou
     defaultValue: T,
     private readonly equal: ValueEqualityFn<T> | undefined,
     private readonly debugName: string | undefined,
-    injector: Injector,
+    private readonly injector: Injector,
     private transferCacheKey: StateKey<T> | undefined,
     getInitialStream?: (request: R) => Signal<ResourceStreamItem<T>> | undefined,
+    loadStrategy: ResourceLoadStrategy = 'eager',
   ) {
     if (isInParamsFunction()) {
       throw invalidResourceCreationInParams();
@@ -219,6 +254,7 @@ export class ResourceImpl<T, R> extends BaseWritableResource<T> implements Resou
       // `WritableSignal` that delegates to `ResourceImpl.set`.
       computed(
         () => {
+          this.track();
           const streamValue = this.state().stream?.();
 
           if (!streamValue) {
@@ -270,60 +306,57 @@ export class ResourceImpl<T, R> extends BaseWritableResource<T> implements Resou
     this.state = linkedSignal<WrappedRequest, ResourceState<T>>({
       // Whenever the request changes,
       source: this.extRequest,
-      // Compute the state of the resource given a change in status.
+      // Compute the state of the resource given a change in status. The first computation may
+      // seed the stream from the transfer cache or `getInitialStream`; everything else is the
+      // request-derived state that `computeState` describes.
       computation: (extRequest, previous) => {
-        let {request, status, error} = extRequest;
-        let stream: Signal<ResourceStreamItem<T>> | undefined;
-
-        if (error) {
-          status = 'resolved';
-          stream = signal(
-            {error: encapsulateResourceError(error)},
-            ngDevMode ? createDebugNameObject(this.debugName, 'stream') : undefined,
-          );
-        } else if (!status) {
-          if (!previous) {
-            const transferState = this.transferState;
-            const cacheKey = this.transferCacheKey;
-            if (cacheState.isActive && cacheKey && transferState && request !== undefined) {
-              const key = this.transferCacheKey;
-              if (transferState.hasKey(cacheKey)) {
-                stream = signal(
-                  {value: transferState.get(cacheKey, defaultValue)},
-                  ngDevMode ? createDebugNameObject(this.debugName, 'stream') : undefined,
-                );
-              }
-            }
-
-            if (!stream) {
-              stream = getInitialStream?.(extRequest.request as R);
-            }
-            // Clear getInitialStream so it doesn't hold onto memory
-            getInitialStream = undefined;
-            status = request === undefined ? 'idle' : stream ? 'resolved' : 'loading';
-          } else {
-            status = request === undefined ? 'idle' : 'loading';
-            if (previous.value.extRequest.request === request) {
-              stream = previous.value.stream;
+        let initialStream: Signal<ResourceStreamItem<T>> | undefined;
+        if (!previous && !extRequest.error && !extRequest.status) {
+          const transferState = this.transferState;
+          const cacheKey = this.transferCacheKey;
+          if (
+            cacheState.isActive &&
+            cacheKey &&
+            transferState &&
+            extRequest.request !== undefined
+          ) {
+            if (transferState.hasKey(cacheKey)) {
+              initialStream = signal(
+                {value: transferState.get(cacheKey, defaultValue)},
+                ngDevMode ? createDebugNameObject(this.debugName, 'stream') : undefined,
+              );
             }
           }
+
+          if (!initialStream) {
+            initialStream = getInitialStream?.(extRequest.request as R);
+          }
+          // Clear getInitialStream so it doesn't hold onto memory
+          getInitialStream = undefined;
         }
 
-        return {
-          extRequest,
-          status,
-          previousStatus: previous ? projectStatusOfState(previous.value) : 'idle',
-          stream,
-        };
+        return computeState(extRequest, previous?.value, initialStream, this.debugName);
       },
       ...(ngDevMode ? createDebugNameObject(debugName, 'state') : undefined),
     });
 
-    this.effectRef = effect(this.loadEffect.bind(this), {
-      injector,
-      manualCleanup: true,
-      ...(ngDevMode ? createDebugNameObject(debugName, 'loadEffect') : undefined),
-    });
+    this.awake = signal(loadStrategy === 'eager');
+    if (loadStrategy !== 'eager') {
+      const node = Object.create(RESOURCE_TRACK_NODE) as ReactiveNode;
+      node.producerOnWatched = () => this.scheduleWake();
+      node.producerOnUnwatched = () => this.scheduleSleep(loadStrategy === 'whileTracked');
+      if (typeof ngDevMode !== 'undefined' && ngDevMode) {
+        node.debugName = createDebugNameObject(debugName, 'track')?.debugName;
+      }
+      runPostProducerCreatedFn(node);
+      this.trackNode = node;
+    } else {
+      this.effectRef = effect(this.loadEffect.bind(this), {
+        injector,
+        manualCleanup: true,
+        ...(ngDevMode ? createDebugNameObject(debugName, 'loadEffect') : undefined),
+      });
+    }
 
     this.pendingTasks = injector.get(PendingTasks);
 
@@ -331,12 +364,26 @@ export class ResourceImpl<T, R> extends BaseWritableResource<T> implements Resou
     this.unregisterOnDestroy = injector.get(DestroyRef).onDestroy(() => this.destroy());
 
     this.status = computed(
-      () => projectStatusOfState(this.state()),
+      () => {
+        // Destroyed resources stay idle even if the params change afterwards.
+        if (this.destroyed) {
+          return 'idle';
+        }
+        this.track();
+        const status = projectStatusOfState(this.state());
+        // While dormant, the internal state speculates about the load that waking would start;
+        // no load is actually running, so the resource truthfully reports itself idle.
+        if (!this.awake() && (status === 'loading' || status === 'reloading')) {
+          return 'idle';
+        }
+        return status;
+      },
       ngDevMode ? createDebugNameObject(debugName, 'status') : undefined,
     );
 
     this.error = computed(
       () => {
+        this.track();
         const stream = this.state().stream?.();
         return stream && !isResolved(stream) ? stream.error : undefined;
       },
@@ -352,15 +399,14 @@ export class ResourceImpl<T, R> extends BaseWritableResource<T> implements Resou
       return;
     }
 
-    const error = untracked(this.error);
+    // Read the raw state: the public signals pull, and set() must never start a load.
     const state = untracked(this.state);
+    const streamValue = state.stream && untracked(state.stream);
+    const error = streamValue && !isResolved(streamValue) ? streamValue.error : undefined;
 
-    if (!error) {
+    if (!error && state.status === 'local') {
       const current = untracked(this.value);
-      if (
-        state.status === 'local' &&
-        (this.equal ? this.equal(current, value) : current === value)
-      ) {
+      if (this.equal ? this.equal(current, value) : current === value) {
         return;
       }
     }
@@ -396,7 +442,12 @@ export class ResourceImpl<T, R> extends BaseWritableResource<T> implements Resou
   destroy(): void {
     this.destroyed = true;
     this.unregisterOnDestroy();
-    this.effectRef.destroy();
+    this.effectRef?.destroy();
+    this.loadEffectRef?.destroy();
+    this.loadEffectRef = undefined;
+    if (this.trackNode !== undefined) {
+      consumerDestroy(this.trackNode);
+    }
     this.abortInProgressLoad();
 
     // Destroyed resources enter Idle state.
@@ -405,6 +456,61 @@ export class ResourceImpl<T, R> extends BaseWritableResource<T> implements Resou
       status: 'idle',
       previousStatus: 'idle',
       stream: undefined,
+    });
+  }
+
+  /**
+   * Registers the tracking node as a dependency of the calling reactive context: this is how a
+   * listener's liveness reaches the node, and its watched/unwatched transitions drive the lazy
+   * lifecycle. A read outside any reactive context registers nothing and wakes nothing.
+   */
+  private track(): void {
+    if (this.trackNode === undefined || this.destroyed) {
+      return;
+    }
+    producerAccessed(this.trackNode);
+  }
+
+  /**
+   * The resource gained its first listener: wake up. Deferred to a microtask because the watched
+   * hook fires during graph mutation; the wake is skipped if every listener already left.
+   */
+  private scheduleWake(): void {
+    queueMicrotask(() => {
+      if (this.destroyed || untracked(this.awake) || this.trackNode!.consumers === undefined) {
+        return;
+      }
+      this.awake.set(true);
+      this.loadEffectRef = effect(this.loadEffect.bind(this), {
+        injector: this.injector,
+        manualCleanup: true,
+        ...(ngDevMode ? createDebugNameObject(this.debugName, 'loadEffect') : undefined),
+      });
+    });
+  }
+
+  /**
+   * The last listener left, go back to sleep: no load may run while nothing tracks the resource,
+   * so the load effect is torn down and any in-flight load is cancelled. `whenTracked` keeps a
+   * settled value for the next listener; `whileTracked` additionally forgets, by recomputing the
+   * state from the current request as if fresh — an abandoned resource is indistinguishable from
+   * one that never loaded, and a params error stays derived rather than erased. Deferred to a
+   * microtask, and skipped if something started listening again in between.
+   */
+  private scheduleSleep(dropValue: boolean): void {
+    queueMicrotask(() => {
+      if (this.destroyed || !untracked(this.awake) || this.trackNode!.consumers !== undefined) {
+        return;
+      }
+      this.loadEffectRef?.destroy();
+      this.loadEffectRef = undefined;
+      this.abortInProgressLoad();
+      this.awake.set(false);
+      if (dropValue) {
+        this.state.set(
+          computeState(untracked(this.extRequest), undefined, undefined, this.debugName),
+        );
+      }
     });
   }
 
@@ -566,6 +672,46 @@ function isStreamingResourceOptions<T, R>(
   options: ResourceOptions<T, R>,
 ): options is StreamingResourceOptions<T, R> {
   return !!(options as StreamingResourceOptions<T, R>).stream;
+}
+
+/**
+ * Derives the resource state from what the request asked for. Called with no previous state, it
+ * also says what "fresh" means — which is why the `whileTracked` sleep reuses it to forget: an
+ * abandoned resource is indistinguishable from one that never loaded.
+ */
+function computeState<T>(
+  extRequest: WrappedRequest,
+  previous: ResourceState<T> | undefined,
+  initialStream: Signal<ResourceStreamItem<T>> | undefined,
+  debugName: string | undefined,
+): ResourceState<T> {
+  let {request, status, error} = extRequest;
+  let stream: Signal<ResourceStreamItem<T>> | undefined;
+
+  if (error) {
+    status = 'resolved';
+    stream = signal(
+      {error: encapsulateResourceError(error)},
+      ngDevMode ? createDebugNameObject(debugName, 'stream') : undefined,
+    );
+  } else if (!status) {
+    if (!previous) {
+      stream = initialStream;
+      status = request === undefined ? 'idle' : stream ? 'resolved' : 'loading';
+    } else {
+      status = request === undefined ? 'idle' : 'loading';
+      if (previous.extRequest.request === request) {
+        stream = previous.stream;
+      }
+    }
+  }
+
+  return {
+    extRequest,
+    status,
+    previousStatus: previous ? projectStatusOfState(previous) : 'idle',
+    stream,
+  };
 }
 
 /**

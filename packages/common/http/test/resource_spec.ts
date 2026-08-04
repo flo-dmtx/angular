@@ -6,9 +6,16 @@
  * found in the LICENSE file at https://angular.dev/license
  */
 
-import {ApplicationRef, Injector, resourceFromSnapshots, signal} from '@angular/core';
+import {
+  ApplicationRef,
+  effect,
+  Injector,
+  resourceFromSnapshots,
+  signal,
+  untracked,
+} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
-import {isNode} from '@angular/private/testing';
+import {isNode, timeout} from '@angular/private/testing';
 import {Observable} from 'rxjs';
 import {
   HttpContext,
@@ -497,6 +504,50 @@ describe('httpResource', () => {
 
       // The request should now have been evaluated
       expect(requestEvaluated).toBe(true);
+    });
+  });
+
+  describe('lazy strategies', () => {
+    async function flush(): Promise<void> {
+      TestBed.tick();
+      await timeout();
+      TestBed.tick();
+      await timeout();
+      TestBed.tick();
+    }
+
+    it("should not send the request until something tracks the resource (loadStrategy: 'whenTracked')", async () => {
+      const backend = TestBed.inject(HttpTestingController);
+      const injector = TestBed.inject(Injector);
+      const res = httpResource(() => '/data', {injector, loadStrategy: 'whenTracked'});
+
+      await flush();
+      backend.expectNone('/data');
+      expect(res.status()).toBe('idle');
+
+      effect(() => res.value(), {injector});
+      await flush();
+
+      const req = backend.expectOne('/data');
+      req.flush(['a']);
+      await TestBed.inject(ApplicationRef).whenStable();
+      expect(res.value()).toEqual(['a']);
+    });
+
+    it("should cancel the in-flight request when the last listener leaves (loadStrategy: 'whileTracked')", async () => {
+      const backend = TestBed.inject(HttpTestingController);
+      const injector = TestBed.inject(Injector);
+      const res = httpResource(() => '/data', {injector, loadStrategy: 'whileTracked'});
+
+      const listener = effect(() => res.value(), {injector});
+      await flush();
+      const req = backend.expectOne('/data');
+      expect(req.cancelled).toBe(false);
+
+      listener.destroy();
+      await flush();
+      expect(req.cancelled).toBe(true);
+      expect(untracked(() => res.status())).toBe('idle');
     });
   });
 });

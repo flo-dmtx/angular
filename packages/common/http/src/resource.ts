@@ -14,6 +14,7 @@ import {
   Injector,
   linkedSignal,
   ɵResourceImpl as ResourceImpl,
+  type ResourceLoadStrategy,
   type ResourceParamsContext,
   ResourceStreamItem,
   Signal,
@@ -278,6 +279,7 @@ function makeHttpResourceFn<TRaw>(responseType: ResponseType) {
       options?.parse as (value: unknown) => TResult,
       options?.equal as ValueEqualityFn<unknown>,
       getInitialStream,
+      options?.loadStrategy,
     ) as HttpResourceRef<TResult>;
   };
 }
@@ -299,8 +301,7 @@ function normalizeRequest(
       ? unwrappedRequest.headers
       : new HttpHeaders(
           unwrappedRequest.headers as
-            | Record<string, string | number | Array<string | number>>
-            | undefined,
+            Record<string, string | number | Array<string | number>> | undefined,
         );
 
   const params =
@@ -367,6 +368,7 @@ class HttpResourceImpl<T>
     getInitialStream?: (
       request: HttpRequest<unknown> | undefined,
     ) => Signal<ResourceStreamItem<T>> | undefined,
+    loadStrategy?: ResourceLoadStrategy,
   ) {
     super(
       request,
@@ -446,6 +448,7 @@ class HttpResourceImpl<T>
       injector,
       undefined,
       getInitialStream,
+      loadStrategy,
     );
     this.client = injector.get(HttpClient);
   }

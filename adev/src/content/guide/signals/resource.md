@@ -139,6 +139,61 @@ The `status` signal provides a specific `ResourceStatus` that describes the stat
 
 You can use this status information to conditionally display user interface elements, such as loading indicators and error messages.
 
+## Lazy resources
+
+By default, a resource runs its loader eagerly: as soon as it is created, and again whenever its `params` change. Setting a lazy `loadStrategy` defers all work until something actually listens to the resource.
+
+```typescript
+const userId: Signal<string> = getUserId();
+
+const userResource = resource({
+  loadStrategy: 'whenTracked',
+  params: () => ({id: userId()}),
+  loader: ({params}) => fetchUser(params),
+});
+```
+
+A lazy resource distinguishes two kinds of access:
+
+- **Tracked reads** — a template or an effect reading any of the resource's signals (`value`, `status`, `error`, `isLoading`, `hasValue`, `snapshot`), directly or through `computed`s. These express interest over time: the first one wakes the resource and starts the load.
+- **Reads outside a reactive context** — including reads inside `untracked()`. These report the current state at that instant and never start anything. A dormant resource reports the `'idle'` status and its `defaultValue`.
+
+Because templates track what they read, a lazy resource behind a false `@if`, a closed tab, or an untriggered `@defer` block never fetches until that part of the UI actually renders — and a guard like `@if (userResource.hasValue())` wakes the resource, so the data it guards can arrive.
+
+Laziness follows these rules, for both strategies:
+
+- No load ever runs while nothing tracks the resource. `params` changes while dormant are remembered, never fetched; the first listener uses the latest params.
+- While tracked, the resource behaves exactly like an eager one: it re-loads on `params` changes, `reload()` works, values and errors flow to its listeners.
+- Calling `set()` moves the resource to the `'local'` status without running the loader, and a later listener does not overwrite the local value.
+- A dormant lazy resource never affects application stability, so server-side rendering does not wait for it.
+
+The two strategies differ in what happens when the _last_ listener disappears:
+
+- `loadStrategy: 'whenTracked'` keeps a settled value: showing the same UI again does not re-fetch (as long as the params did not change in the meantime).
+- `loadStrategy: 'whileTracked'` forgets: any in-flight load is cancelled, the value is dropped and the resource returns to `'idle'`. The next listener starts over with a fresh load. Use it for data that should not outlive the screen showing it.
+
+Lazy resources also work with [chaining](#chaining-resources), and laziness travels the chain:
+
+```typescript
+const user = resource({
+  loadStrategy: 'whenTracked',
+  params: () => ({id: userId()}),
+  loader: ({params}) => fetchUser(params),
+});
+
+const posts = resource({
+  loadStrategy: 'whenTracked',
+  params: ({chain}) => chain(user)?.id,
+  loader: ({params}) => fetchPosts(params),
+});
+```
+
+Nothing loads until something renders `posts.value()`: that first listener wakes `posts`, whose `params` read `user` through `chain` — which makes `posts` a listener of `user` and wakes it in turn. The loads run in order, `user` then `posts`, and neither runs for a UI that stays hidden.
+
+[`rxResource`](/ecosystem/rxjs-interop/signals-interop) and [`httpResource`](/guide/http/http-resource) accept the same `loadStrategy` option.
+
+NOTE: Avoid combining a lazy strategy with the `id` option for [SSR caching](#caching-resource-data-with-ssr): the transferred value is only consulted during hydration, which has usually completed by the time a lazy resource is first tracked.
+
 ## Caching `resource` data with SSR
 
 When an application renders on the server, a resource loader runs once to produce the initial HTML. During hydration, the browser normally runs the same loader again.
@@ -252,9 +307,7 @@ function withPreviousValue<T>(input: Resource<T>): Resource<T> {
   return resourceFromSnapshots(derived);
 }
 
-@Component({
-  /*... */
-})
+@Component({/*... */})
 export class AwesomeProfile {
   userId = input.required<number>();
   user = withPreviousValue(httpResource(() => `/user/${this.userId()}`));

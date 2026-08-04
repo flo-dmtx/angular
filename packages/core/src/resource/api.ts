@@ -177,6 +177,25 @@ export interface ResourceRef<T> extends WritableResource<T> {
 }
 
 /**
+ * When a resource loads.
+ *
+ * - `'eager'` (the default): the loader runs at creation and again whenever `params` change.
+ * - `'whenTracked'`: the resource is dormant until the first time it is tracked by a live
+ *   reactive context (a template or an effect reading any of its signals, directly or through
+ *   computeds). That first listener starts the load; once loaded, the value is retained even
+ *   when nothing tracks the resource anymore.
+ * - `'whileTracked'`: the resource lives exactly while tracked: the first listener starts the
+ *   load, and when the last listener leaves, any in-flight load is cancelled, the value is
+ *   dropped and the resource returns to `idle`. The next listener starts over.
+ *
+ * With a lazy strategy, reads outside a reactive context (including inside `untracked()`) never
+ * start anything: they report the current state, and a dormant resource reports `idle`.
+ *
+ * @publicApi 22.0
+ */
+export type ResourceLoadStrategy = 'eager' | 'whenTracked' | 'whileTracked';
+
+/**
  * Parameter to a `ResourceLoader` which gives the request and other options for the current loading
  * operation.
  *
@@ -241,6 +260,21 @@ export interface BaseResourceOptions<T, R> {
    * This value value needs to be identical for both the client and server.
    */
   id?: string;
+
+  /**
+   * When the resource loads. See `ResourceLoadStrategy`.
+   *
+   * With a lazy strategy (`'whenTracked'` or `'whileTracked'`), the resource performs no work at
+   * creation: the first live reactive context tracking any of its signals starts the load.
+   * `params` changes while dormant are tracked but never fetched; the first listener uses the
+   * latest value. Reads outside a reactive context never start anything.
+   *
+   * Lazy strategies are not recommended with `id`: the `TransferState` cache is only consulted
+   * during hydration, usually over by the time a lazy resource gets its first listener.
+   *
+   * Defaults to `'eager'` (the loader runs at creation and whenever `params` change).
+   */
+  loadStrategy?: ResourceLoadStrategy;
 }
 
 /**
@@ -282,8 +316,7 @@ export interface StreamingResourceOptions<T, R> extends BaseResourceOptions<T, R
  * @publicApi 22.0
  */
 export type ResourceOptions<T, R> = (
-  | PromiseResourceOptions<T, R>
-  | StreamingResourceOptions<T, R>
+  PromiseResourceOptions<T, R> | StreamingResourceOptions<T, R>
 ) & {
   /**
    * A debug name for the reactive node. Used in Angular DevTools to identify the node.
@@ -331,5 +364,4 @@ export interface DebouncedOptions<T> {
  * @experimental 22.0
  */
 export type DebounceTimer<T> =
-  | number
-  | ((value: T, lastValue: ResourceSnapshot<T>) => Promise<void> | void);
+  number | ((value: T, lastValue: ResourceSnapshot<T>) => Promise<void> | void);

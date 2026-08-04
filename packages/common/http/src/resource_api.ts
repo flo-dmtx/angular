@@ -6,7 +6,14 @@
  * found in the LICENSE file at https://angular.dev/license
  */
 
-import type {Injector, ResourceRef, Signal, ValueEqualityFn, WritableResource} from '@angular/core';
+import type {
+  Injector,
+  ResourceLoadStrategy,
+  ResourceRef,
+  Signal,
+  ValueEqualityFn,
+  WritableResource,
+} from '@angular/core';
 import type {HttpHeaders} from './headers';
 import type {HttpParams} from './params';
 import type {HttpProgressEvent} from './response';
@@ -176,6 +183,17 @@ export interface HttpResourceOptions<TResult, TRaw> {
    * A debug name for the reactive node. Used in Angular DevTools to identify the node.
    */
   debugName?: string;
+
+  /**
+   * When the resource loads. See `ResourceLoadStrategy`.
+   *
+   * With a lazy strategy (`'whenTracked'` or `'whileTracked'`), no request is sent at creation:
+   * the first live reactive context tracking any of the resource's signals starts it.
+   *
+   * Defaults to `'eager'` (the request is sent at creation and whenever the request computation
+   * changes).
+   */
+  loadStrategy?: ResourceLoadStrategy;
 }
 
 /**

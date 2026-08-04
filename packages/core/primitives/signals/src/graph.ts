@@ -191,6 +191,22 @@ export interface ReactiveNode {
   consumerOnSignalRead(node: unknown): void;
 
   /**
+   * Optional hook called when this producer gains its first live consumer.
+   *
+   * Mirrors the `watched` callback of the TC39 Signals proposal. Fired synchronously during
+   * graph mutation: implementations must not modify the graph from this hook.
+   */
+  producerOnWatched?(node: unknown): void;
+
+  /**
+   * Optional hook called when this producer loses its last live consumer.
+   *
+   * Mirrors the `unwatched` callback of the TC39 Signals proposal. Fired synchronously during
+   * graph mutation: implementations must not modify the graph from this hook.
+   */
+  producerOnUnwatched?(node: unknown): void;
+
+  /**
    * A debug name for the reactive node. Used in Angular DevTools to identify the node.
    */
   debugName?: string;
@@ -541,6 +557,9 @@ function producerAddLiveConsumer(node: ReactiveNode, link: ReactiveLink): void {
       producerAddLiveConsumer(link.producer, link);
     }
   }
+  if (consumersTail === undefined) {
+    node.producerOnWatched?.(node);
+  }
 }
 
 function producerRemoveLiveConsumerLink(link: ReactiveLink): ReactiveLink | undefined {
@@ -564,6 +583,9 @@ function producerRemoveLiveConsumerLink(link: ReactiveLink): ReactiveLink | unde
       while (producerLink !== undefined) {
         producerLink = producerRemoveLiveConsumerLink(producerLink);
       }
+    }
+    if (nextConsumer === undefined) {
+      producer.producerOnUnwatched?.(producer);
     }
   }
   return nextProducer;

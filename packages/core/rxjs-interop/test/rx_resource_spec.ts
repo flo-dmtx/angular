@@ -7,14 +7,26 @@
  */
 
 import {timeout} from '@angular/private/testing';
-import {BehaviorSubject, EMPTY, Observable, of, Subscriber, throwError} from 'rxjs';
+import {
+  BehaviorSubject,
+  defer,
+  EMPTY,
+  finalize,
+  Observable,
+  of,
+  Subject,
+  Subscriber,
+  throwError,
+} from 'rxjs';
 import {
   ApplicationRef,
   ɵCACHE_ACTIVE as CACHE_ACTIVE,
+  effect,
   Injector,
   makeStateKey,
   signal,
   TransferState,
+  untracked,
 } from '../../src/core';
 import {TestBed} from '../../testing';
 import {rxResource} from '../src';
@@ -401,6 +413,57 @@ describe('rxResource()', () => {
     expect(callCount).toBe(2);
     expect(res.status()).toBe('resolved');
     expect(res.value()).toBe('resolved from second request');
+  });
+
+  describe('lazy strategies', () => {
+    async function flush(): Promise<void> {
+      TestBed.tick();
+      await timeout();
+      TestBed.tick();
+      await timeout();
+      TestBed.tick();
+    }
+
+    it("should not subscribe until something tracks the resource (loadStrategy: 'whenTracked')", async () => {
+      let subscriptions = 0;
+      const injector = TestBed.inject(Injector);
+      const res = rxResource({
+        loadStrategy: 'whenTracked',
+        stream: () => defer(() => (subscriptions++, of(1))),
+        injector,
+      });
+
+      await flush();
+      expect(subscriptions).toBe(0);
+      expect(res.status()).toBe('idle');
+
+      effect(() => res.value(), {injector});
+      await flush();
+
+      expect(subscriptions).toBe(1);
+      expect(res.value()).toBe(1);
+      expect(res.status()).toBe('resolved');
+    });
+
+    it("should unsubscribe when the last listener leaves (loadStrategy: 'whileTracked')", async () => {
+      const injector = TestBed.inject(Injector);
+      let unsubscribed = false;
+      const stream = new Subject<number>();
+      const res = rxResource({
+        loadStrategy: 'whileTracked',
+        stream: () => stream.pipe(finalize(() => (unsubscribed = true))),
+        injector,
+      });
+
+      const listener = effect(() => res.value(), {injector});
+      await flush();
+      expect(unsubscribed).toBe(false);
+
+      listener.destroy();
+      await flush();
+      expect(unsubscribed).toBe(true);
+      expect(untracked(() => res.status())).toBe('idle');
+    });
   });
 });
 
